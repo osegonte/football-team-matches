@@ -1,17 +1,16 @@
-#!/usr/bin/env python3
 """
 FBRef Football Match Data Scraper
 --------------------------------
 A robust, high-performance scraper for extracting match data from FBref.com.
 Features:
-- Direct table extraction using pandas.read_html
+- Direct table extraction using BeautifulSoup with proper comment handling
 - Comprehensive match statistics including xG, possession, shots, etc.
 - Support for scraping multiple teams and seasons
 - Efficient caching to reduce server load
 - Detailed CSV and JSON output
 
 Usage:
-  python scraper.py --team https://fbref.com/en/equipes/822bd0ba/Liverpool-Stats
+  python scraper.py --team https://fbref.com/en/squads/822bd0ba/Liverpool-Stats
 """
 
 import os
@@ -45,7 +44,7 @@ try:
 except ImportError as e:
     logger.error(f"Missing required package: {e}")
     logger.error("Please install required packages with:")
-    logger.error("pip install pandas requests beautifulsoup4 tqdm python-dateutil")
+    logger.error("pip install pandas requests beautifulsoup4 tqdm python-dateutil lxml")
     exit(1)
 
 
@@ -89,6 +88,12 @@ class Cache:
         cache_path = self._get_cache_path(url)
         with open(cache_path, 'w', encoding='utf-8') as f:
             f.write(content)
+            
+    def clear(self) -> None:
+        """Clear all cache files"""
+        for cache_file in self.cache_dir.glob("*.html"):
+            cache_file.unlink()
+        logger.info(f"Cleared cache directory: {self.cache_dir}")
 
 
 class FootballMatchScraper:
@@ -99,7 +104,8 @@ class FootballMatchScraper:
         cache_enabled: bool = True,
         cache_ttl: int = 24,
         user_agent: str = None,
-        debug: bool = False
+        debug: bool = False,
+        force_cache_clear: bool = False
     ):
         """Initialize the football match scraper
         
@@ -108,21 +114,38 @@ class FootballMatchScraper:
             cache_ttl: Cache time-to-live in hours
             user_agent: Custom user agent string
             debug: Enable debug logging
+            force_cache_clear: Force clearing the cache on init
         """
         self.debug = debug
         self.cache_enabled = cache_enabled
         self.cache = Cache(ttl_hours=cache_ttl) if cache_enabled else None
         
-        # Default user agent if none provided
+        # Clear cache if requested
+        if force_cache_clear and self.cache:
+            self.cache.clear()
+        
+        # Default user agent if none provided - use a more browser-like one
         self.user_agent = user_agent or (
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
             'AppleWebKit/537.36 (KHTML, like Gecko) '
             'Chrome/121.0.0.0 Safari/537.36'
         )
         
-        # Session for requests
+        # Session for requests with better headers
         self.session = requests.Session()
-        self.session.headers.update({'User-Agent': self.user_agent})
+        self.session.headers.update({
+            'User-Agent': self.user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://fbref.com/',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        })
         
         if debug:
             logging.getLogger().setLevel(logging.DEBUG)
@@ -136,6 +159,9 @@ class FootballMatchScraper:
         Returns:
             HTML content
         """
+        # Normalize URL to use /en/squads/ path
+        url = url.replace("/en/equipes/", "/en/squads/")
+        
         # Check cache first
         if self.cache_enabled:
             cached = self.cache.get(url)
@@ -146,9 +172,19 @@ class FootballMatchScraper:
         # Fetch using requests
         logger.debug(f"Fetching {url}")
         try:
+            # Add a small delay to avoid rate limiting
+            time.sleep(2)
+            
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
             html = response.text
+            
+            # Save raw HTML for debugging if needed
+            if self.debug:
+                debug_file = f"debug_{hashlib.md5(url.encode()).hexdigest()[:8]}.html"
+                with open(debug_file, 'w', encoding='utf-8') as f:
+                    f.write(html)
+                logger.debug(f"Saved raw HTML to {debug_file}")
             
             # Cache the result
             if html and self.cache_enabled:
@@ -168,6 +204,9 @@ class FootballMatchScraper:
         Returns:
             Team name
         """
+        # Normalize URL to use /en/squads/ path
+        url = url.replace("/en/equipes/", "/en/squads/")
+        
         # Try to extract from URL path
         match = re.search(r'/([^/]+)-Stats$', url)
         if match:
@@ -210,71 +249,107 @@ class FootballMatchScraper:
         Returns:
             List of dictionaries containing match details
         """
+        # Normalize URL to use /en/squads/ path
+        team_url = team_url.replace("/en/equipes/", "/en/squads/")
         matches_url = f"{team_url}/matchlogs/all_comps/schedule/"
         logger.info(f"Loading matches page: {matches_url}")
         
+        # Fetch HTML
         html = self.fetch_url(matches_url)
         if not html:
             logger.error("Failed to fetch matches page")
             return []
+            
+        # Process HTML to extract comments BEFORE parsing
+        html = self.uncomment_html(html)
         
-        # Use pandas to extract the Scores & Fixtures table
-        try:
-            # Parse with pandas
-            matches_df = pd.read_html(io.StringIO(html), match="Scores & Fixtures")[0]
-            
-            # Clean up: drop rows with no date (separators)
-            matches_df = matches_df.dropna(subset=["Date"])
-            
-            # Filter to matches that have a Match Report
-            if "Match Report" in matches_df.columns:
-                matches_df = matches_df[matches_df["Match Report"].notna()]
-            
-            # Extract match links from the HTML
-            soup = BeautifulSoup(html, 'html.parser')
-            match_links = []
-            
-            # Find match report links in the table
-            report_links = {}
-            for a in soup.select('td[data-stat="match_report"] a'):
-                if a.text == "Match Report":
-                    # Extract match ID from href
-                    href = a.get('href', '')
-                    match_id = href.split('/')[2] if len(href.split('/')) > 2 else None
-                    
-                    if match_id:
-                        report_links[match_id] = "https://fbref.com" + href if href.startswith('/') else href
-            
-            # Process each match in the dataframe
-            for idx, row in matches_df.iterrows():
-                # Extract match ID from the Match Report column if available
-                match_id = None
-                if 'Match Report' in row and isinstance(row['Match Report'], str):
-                    m = re.search(r'/matches/([^/]+)/', row['Match Report'])
-                    if m:
-                        match_id = m.group(1)
+        # Create soup from processed HTML
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Try BeautifulSoup approach first (more reliable)
+        match_links = []
+        
+        # Look for match report links in the schedule table
+        for a in soup.select('td[data-stat="match_report"] a'):
+            if a.text.strip() == "Match Report":
+                href = a.get('href', '')
+                match_id = href.split('/')[2] if len(href.split('/')) > 2 else None
                 
-                # If we have a match_id and corresponding link
-                if match_id and match_id in report_links:
+                if match_id:
+                    # Get parent row for additional details
+                    row = a.find_parent('tr')
+                    if not row:
+                        continue
+                        
+                    # Get date and competition info
+                    date_cell = row.select_one('td[data-stat="date"]')
+                    comp_cell = row.select_one('td[data-stat="comp"]')
+                    home_cell = row.select_one('td[data-stat="home_team"]')
+                    away_cell = row.select_one('td[data-stat="away_team"]')
+                    
                     match_details = {
                         'match_id': match_id,
-                        'date': row['Date'] if 'Date' in row else None,
-                        'competition': row['Comp'] if 'Comp' in row else None,
-                        'home_team': row['Home'] if 'Home' in row else None,
-                        'away_team': row['Away'] if 'Away' in row else None,
-                        'match_url': report_links[match_id]
+                        'date': date_cell.text.strip() if date_cell else None,
+                        'competition': comp_cell.text.strip() if comp_cell else None,
+                        'home_team': home_cell.text.strip() if home_cell else None,
+                        'away_team': away_cell.text.strip() if away_cell else None,
+                        'match_url': "https://fbref.com" + href if href.startswith('/') else href
                     }
+                    
                     match_links.append(match_details)
                     
                     if len(match_links) >= num_matches:
                         break
-            
-            logger.info(f"Found {len(match_links)} match links")
-            return match_links
-            
-        except Exception as e:
-            logger.error(f"Error getting match links: {e}")
-            return []
+        
+        # If BeautifulSoup approach failed, try pandas as fallback
+        if not match_links:
+            logger.debug("BeautifulSoup approach found no links, trying pandas fallback")
+            try:
+                # Use pandas to parse HTML tables
+                tables = pd.read_html(io.StringIO(html))
+                
+                # Find the Scores & Fixtures table
+                matches_df = None
+                for table in tables:
+                    if len(table.columns) >= 7 and 'Date' in table.columns and 'Match Report' in table.columns:
+                        matches_df = table
+                        break
+                
+                if matches_df is not None:
+                    # Clean up: drop rows with no date (separators)
+                    matches_df = matches_df.dropna(subset=["Date"])
+                    
+                    # Get match report links (URLs aren't in the DataFrame)
+                    report_links = {}
+                    for a in soup.select('td[data-stat="match_report"] a'):
+                        if a.text.strip() == "Match Report":
+                            match_id = a.get('href', '').split('/')[2] if len(a.get('href', '').split('/')) > 2 else None
+                            if match_id:
+                                report_links[match_id] = "https://fbref.com" + a.get('href') if a.get('href').startswith('/') else a.get('href')
+                    
+                    # Process matches
+                    for _, row in matches_df.iterrows():
+                        for match_id, url in report_links.items():
+                            match_details = {
+                                'match_id': match_id,
+                                'date': str(row['Date']) if 'Date' in row else None,
+                                'competition': str(row['Comp']) if 'Comp' in row else None,
+                                'home_team': str(row['Home']) if 'Home' in row else None,
+                                'away_team': str(row['Away']) if 'Away' in row else None,
+                                'match_url': url
+                            }
+                            match_links.append(match_details)
+                            
+                            if len(match_links) >= num_matches:
+                                break
+                        
+                        if len(match_links) >= num_matches:
+                            break
+            except Exception as e:
+                logger.error(f"Error using pandas fallback: {e}")
+        
+        logger.info(f"Found {len(match_links)} match links")
+        return match_links
     
     def scrape_match_data(self, match_details: Dict[str, str], team_name: str) -> Dict[str, Any]:
         """Scrape data for a specific match
@@ -347,8 +422,12 @@ class FootballMatchScraper:
         # Determine venue and result
         self.determine_venue_result(team_name, match_data)
         
-        # Extract match statistics using pandas.read_html
-        self.extract_match_stats_with_pandas(html, match_data)
+        # Extract match statistics using BeautifulSoup
+        self.extract_match_stats(soup, match_data)
+        
+        # Fallback to pandas approach if stats are still missing
+        if all(match_data[key] is None for key in ['home_possession', 'home_shots']):
+            self.extract_match_stats_with_pandas(html, match_data)
         
         return match_data
     
@@ -436,8 +515,93 @@ class FootballMatchScraper:
                 else:
                     match_data['result'] = 'D'
     
+    def extract_match_stats(self, soup: BeautifulSoup, match_data: Dict[str, Any]) -> None:
+        """Extract match statistics using BeautifulSoup
+        
+        Args:
+            soup: BeautifulSoup object
+            match_data: Match data dictionary to update
+        """
+        # Look for the stats table - multiple possible locations
+        stats_table = None
+        
+        # Try different selectors for stats table
+        for selector in [
+            '#team_stats',
+            '#all_shots_tbl',
+            'table[id*="stats"]',
+            'table[class*="stats"]',
+            'div[id*="stats"] table',
+            'div[class*="stat"] table'
+        ]:
+            tables = soup.select(selector)
+            if tables:
+                stats_table = tables[0]
+                break
+        
+        if not stats_table:
+            logger.debug("Could not find stats table with BeautifulSoup")
+            return
+        
+        # Process each row in the stats table
+        for row in stats_table.select('tr'):
+            # Skip rows without TDs
+            if not row.select('td'):
+                continue
+            
+            # Get all cells - usually stat name, home value, away value
+            cells = row.select('td, th')
+            if len(cells) < 3:
+                continue
+            
+            # Get the stat name, home value, and away value
+            stat_name = cells[0].text.strip().lower()
+            home_val = cells[1].text.strip() if len(cells) > 1 else ""
+            away_val = cells[2].text.strip() if len(cells) > 2 else ""
+            
+            # Process different stats
+            if any(term in stat_name for term in ['possession', 'poss']):
+                match_data['home_possession'] = self.extract_percentage(home_val)
+                match_data['away_possession'] = self.extract_percentage(away_val)
+                
+            elif any(term in stat_name for term in ['shots', 'total shots']):
+                match_data['home_shots'] = self.extract_integer(home_val)
+                match_data['away_shots'] = self.extract_integer(away_val)
+                
+            elif any(term in stat_name for term in ['on target', 'on-target', 'shots on target']):
+                match_data['home_shots_on_target'] = self.extract_integer(home_val)
+                match_data['away_shots_on_target'] = self.extract_integer(away_val)
+                
+            elif 'big chance' in stat_name:
+                match_data['home_big_chances'] = self.extract_integer(home_val)
+                match_data['away_big_chances'] = self.extract_integer(away_val)
+                
+            elif any(term == stat_name for term in ['passes', 'total pass']) and 'accuracy' not in stat_name:
+                match_data['home_passes'] = self.extract_integer(home_val)
+                match_data['away_passes'] = self.extract_integer(away_val)
+                
+            elif any(term in stat_name for term in ['pass acc', 'pass%', 'pass completion']):
+                match_data['home_pass_pct'] = self.extract_percentage(home_val)
+                match_data['away_pass_pct'] = self.extract_percentage(away_val)
+                
+            elif 'corner' in stat_name:
+                match_data['home_corners'] = self.extract_integer(home_val)
+                match_data['away_corners'] = self.extract_integer(away_val)
+                
+            elif 'foul' in stat_name:
+                match_data['home_fouls'] = self.extract_integer(home_val)
+                match_data['away_fouls'] = self.extract_integer(away_val)
+                
+            elif any(term in stat_name for term in ['yellow', 'caution', 'yellow card']):
+                match_data['home_yellow_cards'] = self.extract_integer(home_val)
+                match_data['away_yellow_cards'] = self.extract_integer(away_val)
+                
+            elif any(term in stat_name for term in ['red', 'dismissal', 'send off', 'red card']):
+                match_data['home_red_cards'] = self.extract_integer(home_val)
+                match_data['away_red_cards'] = self.extract_integer(away_val)
+    
     def extract_match_stats_with_pandas(self, html: str, match_data: Dict[str, Any]) -> None:
-        """Extract match statistics using pandas.read_html
+        """Extract match statistics using pandas.read_html as fallback
         
         Args:
             html: HTML content
@@ -445,68 +609,68 @@ class FootballMatchScraper:
         """
         try:
             # Try to find stats tables using pandas
-            # We look for tables that typically contain match stats
             tables = pd.read_html(io.StringIO(html))
             
             for table in tables:
-                # Check if this looks like a stats table
-                # Most stats tables have 3 columns: Stat, Team1, Team2
-                if len(table.columns) >= 3:
-                    # Convert first column to string to avoid errors with numeric values
-                    first_col = table.iloc[:, 0].astype(str).str.lower()
-                    
-                    # Check if common stat terms exist in the first column
-                    stats_terms = ['possession', 'shots', 'on target', 'pass', 'corner', 'foul', 'yellow', 'red']
-                    
-                    if any(term in ' '.join(first_col) for term in stats_terms):
-                        # Process each stat row
-                        for _, row in table.iterrows():
-                            stat_name = str(row.iloc[0]).lower()
+                # Skip tables that are too small
+                if len(table.columns) < 3 or len(table) < 2:
+                    continue
+                
+                # Convert first column to string to avoid errors with numeric values
+                first_col = table.iloc[:, 0].astype(str).str.lower()
+                
+                # Check if common stat terms exist in the first column
+                stats_terms = ['possession', 'shots', 'on target', 'pass', 'corner', 'foul', 'yellow', 'red']
+                
+                if any(term in ' '.join(first_col) for term in stats_terms):
+                    # Process each stat row
+                    for _, row in table.iterrows():
+                        stat_name = str(row.iloc[0]).lower()
+                        
+                        # Get home and away values
+                        home_val = row.iloc[1] if len(row) > 1 else None
+                        away_val = row.iloc[2] if len(row) > 2 else None
+                        
+                        # Process stats
+                        if 'possession' in stat_name or 'poss' in stat_name:
+                            match_data['home_possession'] = self.extract_percentage(home_val)
+                            match_data['away_possession'] = self.extract_percentage(away_val)
                             
-                            # Get home and away values
-                            home_val = row.iloc[1] if len(row) > 1 else None
-                            away_val = row.iloc[2] if len(row) > 2 else None
+                        elif stat_name in ['shots', 'total shots']:
+                            match_data['home_shots'] = self.extract_integer(home_val)
+                            match_data['away_shots'] = self.extract_integer(away_val)
                             
-                            # Process stats
-                            if 'possession' in stat_name or 'poss' in stat_name:
-                                match_data['home_possession'] = self.extract_percentage(home_val)
-                                match_data['away_possession'] = self.extract_percentage(away_val)
-                                
-                            elif stat_name in ['shots', 'total shots']:
-                                match_data['home_shots'] = self.extract_integer(home_val)
-                                match_data['away_shots'] = self.extract_integer(away_val)
-                                
-                            elif 'on target' in stat_name or 'shots on target' in stat_name:
-                                match_data['home_shots_on_target'] = self.extract_integer(home_val)
-                                match_data['away_shots_on_target'] = self.extract_integer(away_val)
-                                
-                            elif 'big chance' in stat_name:
-                                match_data['home_big_chances'] = self.extract_integer(home_val)
-                                match_data['away_big_chances'] = self.extract_integer(away_val)
-                                
-                            elif stat_name in ['passes', 'total pass'] and 'accuracy' not in stat_name:
-                                match_data['home_passes'] = self.extract_integer(home_val)
-                                match_data['away_passes'] = self.extract_integer(away_val)
-                                
-                            elif any(x in stat_name for x in ['pass acc', 'pass%', 'pass completion']):
-                                match_data['home_pass_pct'] = self.extract_percentage(home_val)
-                                match_data['away_pass_pct'] = self.extract_percentage(away_val)
-                                
-                            elif 'corner' in stat_name:
-                                match_data['home_corners'] = self.extract_integer(home_val)
-                                match_data['away_corners'] = self.extract_integer(away_val)
-                                
-                            elif 'foul' in stat_name:
-                                match_data['home_fouls'] = self.extract_integer(home_val)
-                                match_data['away_fouls'] = self.extract_integer(away_val)
-                                
-                            elif any(x in stat_name for x in ['yellow', 'caution', 'yellow card']):
-                                match_data['home_yellow_cards'] = self.extract_integer(home_val)
-                                match_data['away_yellow_cards'] = self.extract_integer(away_val)
-                                
-                            elif any(x in stat_name for x in ['red', 'dismissal', 'send off', 'red card']):
-                                match_data['home_red_cards'] = self.extract_integer(home_val)
-                                match_data['away_red_cards'] = self.extract_integer(away_val)
+                        elif 'on target' in stat_name or 'shots on target' in stat_name:
+                            match_data['home_shots_on_target'] = self.extract_integer(home_val)
+                            match_data['away_shots_on_target'] = self.extract_integer(away_val)
+                            
+                        elif 'big chance' in stat_name:
+                            match_data['home_big_chances'] = self.extract_integer(home_val)
+                            match_data['away_big_chances'] = self.extract_integer(away_val)
+                            
+                        elif stat_name in ['passes', 'total pass'] and 'accuracy' not in stat_name:
+                            match_data['home_passes'] = self.extract_integer(home_val)
+                            match_data['away_passes'] = self.extract_integer(away_val)
+                            
+                        elif any(x in stat_name for x in ['pass acc', 'pass%', 'pass completion']):
+                            match_data['home_pass_pct'] = self.extract_percentage(home_val)
+                            match_data['away_pass_pct'] = self.extract_percentage(away_val)
+                            
+                        elif 'corner' in stat_name:
+                            match_data['home_corners'] = self.extract_integer(home_val)
+                            match_data['away_corners'] = self.extract_integer(away_val)
+                            
+                        elif 'foul' in stat_name:
+                            match_data['home_fouls'] = self.extract_integer(home_val)
+                            match_data['away_fouls'] = self.extract_integer(away_val)
+                            
+                        elif any(x in stat_name for x in ['yellow', 'caution', 'yellow card']):
+                            match_data['home_yellow_cards'] = self.extract_integer(home_val)
+                            match_data['away_yellow_cards'] = self.extract_integer(away_val)
+                            
+                        elif any(x in stat_name for x in ['red', 'dismissal', 'send off', 'red card']):
+                            match_data['home_red_cards'] = self.extract_integer(home_val)
+                            match_data['away_red_cards'] = self.extract_integer(away_val)
         
         except Exception as e:
             logger.error(f"Error extracting stats with pandas: {e}")
@@ -568,6 +732,9 @@ class FootballMatchScraper:
         Returns:
             List of match data dictionaries
         """
+        # Normalize URL to use /en/squads/ path
+        team_url = team_url.replace("/en/equipes/", "/en/squads/")
+        
         # Extract team name
         team_name = self.extract_team_name(team_url)
         logger.info(f"Scraping {num_matches} recent matches for {team_name}")
@@ -592,7 +759,7 @@ class FootballMatchScraper:
                 # Update progress bar
                 pbar.update(1)
                 # Be nice to the server
-                time.sleep(2)
+                time.sleep(3)  # Increased delay to avoid rate limiting
             except Exception as e:
                 logger.error(f"Error scraping match {match_details['match_url']}: {e}")
                 pbar.update(1)
@@ -664,8 +831,6 @@ class FootballMatchScraper:
             logger.info(f"Saved JSON data to {json_path}")
         
         return csv_path, json_path
-
-
 def main():
     """Main entry point for the scraper"""
     parser = argparse.ArgumentParser(
@@ -676,7 +841,7 @@ def main():
     parser.add_argument(
         '--team', 
         type=str, 
-        help='FBref team URL (e.g., https://fbref.com/en/equipes/822bd0ba/Liverpool-Stats)'
+        help='FBref team URL (e.g., https://fbref.com/en/squads/822bd0ba/Liverpool-Stats)'
     )
     
     parser.add_argument(
@@ -705,6 +870,12 @@ def main():
         '--no-cache', 
         action='store_true', 
         help='Disable caching'
+    )
+    
+    parser.add_argument(
+        '--clear-cache', 
+        action='store_true', 
+        help='Clear cache before running'
     )
     
     parser.add_argument(
@@ -743,7 +914,8 @@ def main():
         cache_enabled=not args.no_cache,
         cache_ttl=args.cache_ttl,
         user_agent=args.user_agent,
-        debug=args.debug
+        debug=args.debug,
+        force_cache_clear=args.clear_cache
     )
     
     try:
@@ -758,6 +930,9 @@ def main():
         
         # Process each team
         for team_url in team_urls:
+            # Normalize URL to use /en/squads/ path
+            team_url = team_url.replace("/en/equipes/", "/en/squads/")
+            
             team_name = scraper.extract_team_name(team_url)
             logger.info(f"Processing team: {team_name}")
             
@@ -772,6 +947,9 @@ def main():
         logger.info("Interrupted by user")
     except Exception as e:
         logger.error(f"Error: {e}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":

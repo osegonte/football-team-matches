@@ -2,5 +2,9 @@ selenium==4.25.0
 webdriver-manager==4.0.2
 pandas==2.0.3
 beautifulsoup4==4.12.3
-requests==2.31.0
+python-dateutil==2.8.2
 tqdm==4.66.5
+aiohttp==3.9.3
+aiofiles==23.2.1
+requests==2.31.0
+lxml==5.1.0
